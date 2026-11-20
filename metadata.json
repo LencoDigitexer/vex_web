@@ -1,0 +1,5 @@
+{
+  "name": "bro_bot / VexV5 Web Control Console",
+  "description": "Web simulation, VexV5 SPI protocol inspector, and Web Serial control console for the bro_bot differential-drive robot and 6-DOF Dynamixel manipulator.",
+  "requestFramePermissions": []
+}

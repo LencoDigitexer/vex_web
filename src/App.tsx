@@ -25,7 +25,6 @@ import { ManipulatorPanel } from './components/ManipulatorPanel';
 import { MotorControlPanel } from './components/MotorControlPanel';
 import { PhoneSensorView } from './components/PhoneSensorView';
 import { ProtocolAndSerialPanel } from './components/ProtocolAndSerialPanel';
-import { useEsp32Socket } from './lib/esp32Client';
 import type { ClientRole, PhoneGpsData, PhoneImuData } from './lib/relayTypes';
 import {
   RobotSimState,
@@ -94,11 +93,18 @@ export function App() {
   const [roomInput, setRoomInput] = useState<string>(initial.roomId);
   const [customRelayUrl, setCustomRelayUrl] = useState<string>(() => getDefaultRelayUrl());
 
+  // ESP32 Host/Port in POISK_LAN (TCP port 8080 via server.ts, or HTTP port 80 direct)
+  const [espHost, setEspHost] = useState<string>(() => {
+    if (typeof window === 'undefined') return 'brobot.local';
+    return window.localStorage.getItem('brobot_esp32_host') || 'brobot.local';
+  });
+  const [espPort, setEspPort] = useState<number>(8080);
+
   const [showQrModal, setShowQrModal] = useState(false);
   const [showSketchModal, setShowSketchModal] = useState(false);
   const [copiedPhoneLink, setCopiedPhoneLink] = useState(false);
 
-  // Serverless WebRTC P2P state on PC (for GitHub Pages without Node relay)
+  // Serverless WebRTC P2P state on PC
   const [p2pOfferInput, setP2pOfferInput] = useState('');
   const [p2pAnswerCode, setP2pAnswerCode] = useState('');
   const [p2pStatus, setP2pStatus] = useState('idle');
@@ -126,9 +132,9 @@ export function App() {
     ),
   ]);
   const [serialLogs, setSerialLogs] = useState<string[]>([
-    '[POISK_LAN] Сеть: ПК (Ubuntu) ↔ ESP32 (Wi-Fi ws://brobot.local:81) ↔ Mega2560 (Serial2)',
+    '[POISK_LAN] Сеть: ПК (Ubuntu) ↔ ESP32 (WiFiServer :8080) ↔ Mega2560 (Serial2, переключатель MCU)',
     '[Vex5] Vex5.begin(500000, -1, 0) · HW Version 5',
-    'Подключите ESP32 к Wi-Fi POISK_LAN, а смартфон откройте в режиме «Телефон (Камера/GPS)».',
+    'Укажите IP ESP32 из Serial Monitor (например 192.168.1.50) и нажмите «Подкл. Wi-Fi».',
   ]);
 
   const [megaTelemetryAlive, setMegaTelemetryAlive] = useState(false);
@@ -145,47 +151,44 @@ export function App() {
     setPackets((prev) => [pkt, ...prev].slice(0, 60));
   }, []);
 
-  // Parse telemetry lines coming from Mega2560 -> Serial2 -> ESP32 WebSocket
-  const handleEsp32Line = useCallback(
-    (line: string) => {
-      appendSerial([`[ESP32 RX] ${line}`]);
-      const m = line.match(
-        /TELEM\s+L\((-?\d+),(-?\d+),(-?\d+)\)\s+R\((-?\d+),(-?\d+),(-?\d+)\)\s+DIST=(\d+)/
-      );
-      if (m) {
-        setMegaTelemetryAlive(true);
-        const posL = Number(m[1]);
-        const spdL = Number(m[2]);
-        const pwrL = Number(m[3]);
-        const posR = Number(m[4]);
-        const spdR = Number(m[5]);
-        const pwrR = Number(m[6]);
-        const distanceMm = Number(m[7]);
-        setSim((prev) => ({
-          ...prev,
-          leftMotor: {
-            ...prev.leftMotor,
-            realPositionTicks: posL,
-            realSpeed: spdL,
-            realPower: pwrL,
-          },
-          rightMotor: {
-            ...prev.rightMotor,
-            realPositionTicks: posR,
-            realSpeed: spdR,
-            realPower: pwrR,
-          },
-          distanceSensor: { ...prev.distanceSensor, distanceMm },
-        }));
+  // Parse telemetry lines coming from Mega2560 -> Serial2 -> ESP32 Serial -> TCP
+  const handleEsp32Lines = useCallback(
+    (lines: string[]) => {
+      appendSerial(lines.map((l) => `[ESP32 RX] ${l}`));
+      for (const line of lines) {
+        const m = line.match(
+          /TELEM\s+L\((-?\d+),(-?\d+),(-?\d+)\)\s+R\((-?\d+),(-?\d+),(-?\d+)\)\s+DIST=(\d+)/
+        );
+        if (m) {
+          setMegaTelemetryAlive(true);
+          const posL = Number(m[1]);
+          const spdL = Number(m[2]);
+          const pwrL = Number(m[3]);
+          const posR = Number(m[4]);
+          const spdR = Number(m[5]);
+          const pwrR = Number(m[6]);
+          const distanceMm = Number(m[7]);
+          setSim((prev) => ({
+            ...prev,
+            leftMotor: {
+              ...prev.leftMotor,
+              realPositionTicks: posL,
+              realSpeed: spdL,
+              realPower: pwrL,
+            },
+            rightMotor: {
+              ...prev.rightMotor,
+              realPositionTicks: posR,
+              realSpeed: spdR,
+              realPower: pwrR,
+            },
+            distanceSensor: { ...prev.distanceSensor, distanceMm },
+          }));
+        }
       }
     },
     [appendSerial]
   );
-
-  const esp32 = useEsp32Socket({
-    onLine: handleEsp32Line,
-    onStatusLog: (msg) => appendSerial([msg]),
-  });
 
   const deviceLabel = useMemo(
     () => (role === 'phone' ? 'Android Camera/GPS' : 'Ubuntu PC Controller'),
@@ -197,6 +200,7 @@ export function App() {
     role,
     deviceLabel,
     customRelayUrl,
+    onEsp32Rx: handleEsp32Lines,
   });
 
   useEffect(() => {
@@ -222,10 +226,18 @@ export function App() {
 
   const sendToRobot = useCallback(
     (serialText: string) => {
-      const sentEsp = esp32.sendCommandLine(serialText);
-      if (sentEsp) {
-        appendSerial([`[PC → ESP32] ${serialText}`]);
+      if (relay.snapshot.esp32Status.connected) {
+        relay.sendEsp32Tcp(serialText);
+        appendSerial([`[PC → ESP32 TCP] ${serialText}`]);
+      } else if (!relay.wsConnected && espHost.trim()) {
+        // Direct HTTP fallback on port 80 when running statically without server.ts
+        void fetch(`http://${espHost.trim()}/cmd?c=${encodeURIComponent(serialText)}`).catch(
+          () => {
+            // ignore offline fallback error
+          }
+        );
       }
+
       if (localSerialConnected && serialPortRef.current?.writable) {
         const writer = serialPortRef.current.writable.getWriter();
         void writer
@@ -233,8 +245,33 @@ export function App() {
           .finally(() => writer.releaseLock());
       }
     },
-    [appendSerial, esp32, localSerialConnected]
+    [appendSerial, espHost, localSerialConnected, relay]
   );
+
+  const handleToggleEsp32Connect = () => {
+    const cleanHost = espHost.trim() || 'brobot.local';
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem('brobot_esp32_host', cleanHost);
+    }
+
+    if (relay.snapshot.esp32Status.connected) {
+      relay.disconnectEsp32Tcp();
+      setMegaTelemetryAlive(false);
+      appendSerial(['[ESP32 TCP] Отключено']);
+      return;
+    }
+
+    if (relay.wsConnected) {
+      appendSerial([`[ESP32 TCP] Подключение к ${cleanHost}:${espPort} через POISK_LAN...`]);
+      relay.connectEsp32Tcp(cleanHost, espPort);
+    } else {
+      appendSerial([
+        '[ESP32] Локальный Node-сервер (server.ts) не активен. Отправляю HTTP-команды напрямую на http://' +
+          cleanHost +
+          '/cmd',
+      ]);
+    }
+  };
 
   const handleDriveVector = useCallback(
     (leftSpeed: number, rightSpeed: number, label: string) => {
@@ -470,7 +507,6 @@ export function App() {
     }
   };
 
-  // Accept WebRTC Offer from Phone on PC (for pure static GitHub Pages)
   const handleAcceptP2pOffer = async () => {
     if (!p2pOfferInput.trim()) return;
     try {
@@ -517,6 +553,7 @@ export function App() {
   };
 
   const { snapshot } = relay;
+  const { esp32Status } = snapshot;
   const activeGps = p2pGps ?? snapshot.gps;
   const activeImu = p2pImu ?? snapshot.imu;
 
@@ -535,8 +572,8 @@ export function App() {
                   bro_bot · Wi-Fi POISK_LAN Control Console
                 </h1>
                 <p className="text-xs text-slate-400">
-                  1) Телефон (Камера + GPS) · 2) ПК (Управление) · 3) ESP32 (Wi-Fi POISK_LAN) ↔ 4)
-                  Mega2560 (Моторы)
+                  1) Телефон (Камера + GPS) · 2) ПК (Управление) · 3) ESP32 (WiFiServer :8080) ↔ 4)
+                  Mega2560 (Serial2, MCU)
                 </p>
               </div>
             </div>
@@ -592,38 +629,45 @@ export function App() {
           {/* Row 2: 4-Device POISK_LAN Connection Bar */}
           <div className="flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-slate-800/70">
             <div className="flex flex-wrap items-center gap-2 text-xs">
-              {/* ESP32 Direct Wi-Fi POISK_LAN */}
+              {/* ESP32 TCP Host:Port on POISK_LAN */}
               <form
                 onSubmit={(e) => {
                   e.preventDefault();
-                  if (esp32.status.connected) esp32.disconnect();
-                  else esp32.connect();
+                  handleToggleEsp32Connect();
                 }}
                 className="flex items-center gap-1.5 rounded-lg border border-slate-800 bg-slate-950 px-2 py-1"
               >
                 <Wifi
                   className={`w-3.5 h-3.5 ${
-                    esp32.status.connected ? 'text-emerald-400' : 'text-slate-400'
+                    esp32Status.connected ? 'text-emerald-400' : 'text-slate-400'
                   }`}
                 />
-                <span className="text-slate-400">ESP32:</span>
+                <span className="text-slate-400">ESP32 IP:</span>
                 <input
                   type="text"
-                  value={esp32.espUrl}
-                  onChange={(e) => esp32.setEspUrl(e.target.value)}
-                  disabled={esp32.status.connected}
-                  className="w-40 bg-transparent font-mono text-xs text-slate-100 focus:outline-none"
-                  placeholder="ws://brobot.local:81"
+                  value={espHost}
+                  onChange={(e) => setEspHost(e.target.value)}
+                  disabled={esp32Status.connected}
+                  className="w-28 bg-transparent font-mono text-xs text-slate-100 focus:outline-none"
+                  placeholder="192.168.1.50"
+                />
+                <span className="text-slate-600">:</span>
+                <input
+                  type="number"
+                  value={espPort}
+                  onChange={(e) => setEspPort(Number(e.target.value) || 8080)}
+                  disabled={esp32Status.connected}
+                  className="w-12 bg-transparent font-mono text-xs text-slate-100 focus:outline-none"
                 />
                 <button
                   type="submit"
                   className={`px-2 py-0.5 rounded text-[11px] font-medium ${
-                    esp32.status.connected
+                    esp32Status.connected
                       ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
                       : 'bg-sky-600 hover:bg-sky-500 text-white'
                   }`}
                 >
-                  {esp32.status.connected ? 'Откл.' : 'Подкл. Wi-Fi'}
+                  {esp32Status.connected ? 'Откл.' : 'Подкл. TCP'}
                 </button>
               </form>
 
@@ -729,7 +773,13 @@ export function App() {
           />
         ) : (
           <>
-            {/* Live Phone Camera + GPS/IMU + GitHub Pages P2P pairing */}
+            {esp32Status.lastError && (
+              <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-2.5 text-xs text-amber-200">
+                {esp32Status.lastError}
+              </div>
+            )}
+
+            {/* Live Phone Camera + GPS/IMU */}
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
               <div className="lg:col-span-2 rounded-xl border border-slate-800 bg-slate-900/70 p-4 space-y-3">
                 <div className="flex flex-wrap items-center justify-between gap-2">
@@ -784,7 +834,6 @@ export function App() {
                   ))}
               </div>
 
-              {/* GPS / IMU + Serverless P2P / Relay Setup */}
               <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4 flex flex-col justify-between space-y-3">
                 <div className="space-y-2.5">
                   <div className="flex items-center gap-2">
@@ -825,7 +874,6 @@ export function App() {
                   </div>
                 </div>
 
-                {/* Serverless WebRTC Answer block for GitHub Pages */}
                 <div className="rounded-lg border border-slate-800 bg-slate-950/90 p-2.5 space-y-1.5">
                   <div className="flex items-center justify-between text-[11px]">
                     <span className="text-slate-300 font-medium inline-flex items-center gap-1">
@@ -869,12 +917,6 @@ export function App() {
                 </div>
               </div>
             </div>
-
-            {esp32.status.lastError && (
-              <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-2.5 text-xs text-amber-200">
-                {esp32.status.lastError}
-              </div>
-            )}
 
             <ArenaViewport
               sim={sim}

@@ -14,6 +14,7 @@ interface UseRelaySocketOptions {
   deviceLabel: string;
   customRelayUrl?: string;
   onRtcSignal?: (fromRole: ClientRole, signal: unknown) => void;
+  onEsp32Rx?: (lines: string[]) => void;
 }
 
 const DEFAULT_SNAPSHOT = (roomId: string): RoomSnapshot => ({
@@ -25,6 +26,13 @@ const DEFAULT_SNAPSHOT = (roomId: string): RoomSnapshot => ({
   latestCameraFrame: null,
   gps: null,
   imu: null,
+  esp32Status: {
+    connected: false,
+    host: 'brobot.local',
+    port: 8080,
+    wifiSsid: 'POISK_LAN',
+    lastError: null,
+  },
   serverTime: Date.now(),
 });
 
@@ -43,6 +51,7 @@ export function useRelaySocket({
   deviceLabel,
   customRelayUrl,
   onRtcSignal,
+  onEsp32Rx,
 }: UseRelaySocketOptions) {
   const [wsConnected, setWsConnected] = useState(false);
   const [rttMs, setRttMs] = useState<number | null>(null);
@@ -50,7 +59,9 @@ export function useRelaySocket({
 
   const wsRef = useRef<WebSocket | null>(null);
   const onRtcSignalRef = useRef(onRtcSignal);
+  const onEsp32RxRef = useRef(onEsp32Rx);
   onRtcSignalRef.current = onRtcSignal;
+  onEsp32RxRef.current = onEsp32Rx;
 
   const activeUrl = customRelayUrl !== undefined ? customRelayUrl.trim() : getDefaultRelayUrl();
 
@@ -147,6 +158,16 @@ export function useRelaySocket({
           return;
         }
 
+        if (msg.type === 'esp32:status') {
+          setSnapshot((prev) => ({ ...prev, esp32Status: msg.status }));
+          return;
+        }
+
+        if (msg.type === 'esp32:rx') {
+          onEsp32RxRef.current?.(msg.lines);
+          return;
+        }
+
         if (msg.type === 'rtc:signal') {
           onRtcSignalRef.current?.(msg.fromRole, msg.signal);
         }
@@ -200,6 +221,22 @@ export function useRelaySocket({
     [role, roomId, sendRaw]
   );
 
+  const connectEsp32Tcp = useCallback(
+    (host: string, port: number) =>
+      sendRaw({ type: 'esp32:connect', roomId, host, port }),
+    [roomId, sendRaw]
+  );
+
+  const disconnectEsp32Tcp = useCallback(
+    () => sendRaw({ type: 'esp32:disconnect', roomId }),
+    [roomId, sendRaw]
+  );
+
+  const sendEsp32Tcp = useCallback(
+    (line: string) => sendRaw({ type: 'esp32:send', roomId, line }),
+    [roomId, sendRaw]
+  );
+
   return {
     activeUrl,
     wsConnected,
@@ -208,5 +245,8 @@ export function useRelaySocket({
     sendCameraFrame,
     sendSensors,
     sendRtcSignal,
+    connectEsp32Tcp,
+    disconnectEsp32Tcp,
+    sendEsp32Tcp,
   };
 }

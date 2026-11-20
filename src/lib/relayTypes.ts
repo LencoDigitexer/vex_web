@@ -21,33 +21,10 @@ export interface PhoneImuData {
 
 export interface Esp32Status {
   connected: boolean;
-  url: string;
+  host: string;
+  port: number;
   wifiSsid: string;
   lastError: string | null;
-}
-
-export interface RobotCommandPayload {
-  commandId: string;
-  kind:
-    | 'drive'
-    | 'set_position'
-    | 'set_max_current'
-    | 'reset_encoder'
-    | 'arm_joint'
-    | 'arm_pose'
-    | 'optical_led'
-    | 'raw_serial';
-  serialText: string;
-  leftSpeed?: number;
-  rightSpeed?: number;
-  side?: 'left' | 'right';
-  angleDeg?: number;
-  maxSpeed?: number;
-  maxCurrentMa?: number;
-  jointId?: number;
-  angles?: number[];
-  ledOn?: boolean;
-  timestamp: number;
 }
 
 export interface RoomSnapshot {
@@ -59,6 +36,7 @@ export interface RoomSnapshot {
   latestCameraFrame: string | null;
   gps: PhoneGpsData | null;
   imu: PhoneImuData | null;
+  esp32Status: Esp32Status;
   serverTime: number;
 }
 
@@ -80,6 +58,21 @@ export type RelayClientMessage =
       roomId: string;
       gps: PhoneGpsData | null;
       imu: PhoneImuData | null;
+    }
+  | {
+      type: 'esp32:connect';
+      roomId: string;
+      host: string;
+      port: number;
+    }
+  | {
+      type: 'esp32:disconnect';
+      roomId: string;
+    }
+  | {
+      type: 'esp32:send';
+      roomId: string;
+      line: string;
     }
   | {
       type: 'rtc:signal';
@@ -113,6 +106,14 @@ export type RelayServerMessage =
       type: 'phone:sensors';
       gps: PhoneGpsData | null;
       imu: PhoneImuData | null;
+    }
+  | {
+      type: 'esp32:status';
+      status: Esp32Status;
+    }
+  | {
+      type: 'esp32:rx';
+      lines: string[];
     }
   | {
       type: 'rtc:signal';

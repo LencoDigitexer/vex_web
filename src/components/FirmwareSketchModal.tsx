@@ -8,36 +8,26 @@ interface FirmwareSketchModalProps {
 
 const ESP32_WIFI_SKETCH = `#include <WiFi.h>
 #include <ESPmDNS.h>
-#include <WebSocketsServer.h> // Библиотека Links2004/arduinoWebSockets
 
-// Встроенная ESP32: Wi-Fi POISK_LAN <-> Serial2 (Mega2560)
-// БЕЗ Bluetooth!
+// Встроенная ESP-WROOM-32 на плате КПМИС (Vex V5 Arduino Shield)
+// БЕЗ сторонних библиотек — только встроенные WiFi.h и ESPmDNS.h!
+// ВАЖНО ПО АППАРАТНОЙ ЧАСТИ КПМИС:
+//   - Переключатель в положении USB: прошивка ESP32 и просмотр Serial Monitor (115200).
+//   - Переключатель в положении MCU: ESP32 Serial (RX0/TX0) соединяется с Mega2560 Serial2!
+
 const char* WIFI_SSID = "POISK_LAN";
-const char* WIFI_PASS = ""; // Укажите пароль от POISK_LAN (или "" если открытая)
+const char* WIFI_PASS = ""; // Укажите пароль от POISK_LAN (или "" если сеть открытая)
 
-#define RXD2 16
-#define TXD2 17
+WiFiServer tcpServer(8080); // Порт для постоянного TCP-моста с ноутбуком (server.ts)
+WiFiServer httpServer(80);  // Порт 80 для HTTP команд / статуса в браузере
+WiFiClient tcpClient;
 
-WebSocketsServer webSocket = WebSocketsServer(81);
-String serial2Buf = "";
-
-void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
-  if (type == WStype_CONNECTED) {
-    IPAddress ip = webSocket.remoteIP(num);
-    Serial.printf("[WS] PC connected: %s\\n", ip.toString().c_str());
-    webSocket.sendTXT(num, "[ESP32] Connected on POISK_LAN -> Mega2560 Serial2");
-  } else if (type == WStype_TEXT) {
-    // Пересылаем команду от ПК напрямую в Mega2560 через Serial2
-    Serial2.write(payload, length);
-    if (length > 0 && payload[length - 1] != '\\n') {
-      Serial2.write('\\n');
-    }
-  }
-}
+String uartLine = "";
 
 void setup() {
+  // На шилде КПМИС при положении MCU порт Serial (UART0) подключён к Mega2560 Serial2!
   Serial.begin(115200);
-  Serial2.begin(115200, SERIAL_8N1, RXD2, TXD2);
+  delay(100);
 
   WiFi.mode(WIFI_STA);
   if (strlen(WIFI_PASS) > 0) {
@@ -48,7 +38,7 @@ void setup() {
 
   Serial.print("Connecting to POISK_LAN");
   while (WiFi.status() != WL_CONNECTED) {
-    delay(400);
+    delay(500);
     Serial.print(".");
   }
   Serial.println();
@@ -56,34 +46,75 @@ void setup() {
   Serial.println(WiFi.localIP());
 
   if (MDNS.begin("brobot")) {
-    Serial.println("mDNS active: ws://brobot.local:81");
+    Serial.println("mDNS: brobot.local");
   }
 
-  webSocket.begin();
-  webSocket.onEvent(onWebSocketEvent);
+  tcpServer.begin();
+  httpServer.begin();
 }
 
 void loop() {
-  webSocket.loop();
+  // 1) Принимаем новое TCP-подключение от ноутбука (порт 8080)
+  WiFiClient newClient = tcpServer.available();
+  if (newClient) {
+    if (tcpClient) tcpClient.stop();
+    tcpClient = newClient;
+    tcpClient.println("[ESP32] Connected on POISK_LAN -> Mega2560 Serial2 (115200)");
+  }
 
-  // Читаем телеметрию от Mega2560 (Serial2) и отправляем всем ПК в WebSocket
-  while (Serial2.available()) {
-    char c = (char)Serial2.read();
-    if (c == '\\n') {
-      serial2Buf.trim();
-      if (serial2Buf.length() > 0) {
-        webSocket.broadcastTXT(serial2Buf);
-      }
-      serial2Buf = "";
-    } else {
-      serial2Buf += c;
+  // 2) Читаем команды из TCP от ПК -> отправляем в Mega2560 по Serial
+  if (tcpClient && tcpClient.connected()) {
+    while (tcpClient.available()) {
+      char c = (char)tcpClient.read();
+      Serial.write(c);
     }
+  }
+
+  // 3) Читаем телеметрию от Mega2560 (Serial2 -> ESP32 Serial) -> отправляем на ПК по TCP
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\\n') {
+      uartLine.trim();
+      if (uartLine.length() > 0 && tcpClient && tcpClient.connected()) {
+        tcpClient.println(uartLine);
+      }
+      uartLine = "";
+    } else if (c != '\\r') {
+      uartLine += c;
+    }
+  }
+
+  // 4) Дополнительно: простые HTTP-команды на порт 80 (http://<IP>/cmd?c=stop)
+  WiFiClient http = httpServer.available();
+  if (http) {
+    String req = http.readStringUntil('\\r');
+    http.readStringUntil('\\n');
+    while (http.available()) http.read();
+
+    int idx = req.indexOf("/cmd?c=");
+    if (idx >= 0) {
+      int sp = req.indexOf(' ', idx);
+      String cmd = (sp > idx) ? req.substring(idx + 7, sp) : req.substring(idx + 7);
+      cmd.replace("%20", " ");
+      Serial.println(cmd);
+    }
+
+    http.println("HTTP/1.1 200 OK");
+    http.println("Access-Control-Allow-Origin: *");
+    http.println("Content-Type: text/plain");
+    http.println("Connection: close");
+    http.println();
+    http.println("OK");
+    delay(1);
+    http.stop();
   }
 }`;
 
 const MEGA2560_SKETCH = `#include <Vex5.h>
 
-// bro_bot: Arduino Mega2560 (Моторы VexV5 + Датчики) <-> Serial2 (ESP32 Wi-Fi POISK_LAN)
+// bro_bot: Arduino Mega2560 (КПМИС Vex V5 Shield)
+// Переключатель ESP32 на шилде должен стоять в положении MCU!
+// Тогда Serial2 на Mega2560 напрямую соединён с ESP32 Serial (115200 бод).
 #define BAUDRATE         (500000)
 #define SPI_NSS_PIN      (-1)
 #define IS_RESET_SHIELD  (0)
@@ -97,8 +128,8 @@ String cmdLine = "";
 unsigned long lastTelemetryMs = 0;
 
 void setup() {
-  Serial.begin(115200);   // Отладка по USB
-  Serial2.begin(115200);  // Связь с ESP32 (Wi-Fi POISK_LAN)
+  Serial.begin(115200);   // Отладка по USB компьютера
+  Serial2.begin(115200);  // Связь со встроенной ESP32 (переключатель = MCU)
   Vex5.begin(BAUDRATE, SPI_NSS_PIN, IS_RESET_SHIELD);
 
   motorRight.begin(VEX5_PORT_1);
@@ -161,7 +192,7 @@ void loop() {
     if (c == '\\n') {
       handleCommand(cmdLine);
       cmdLine = "";
-    } else {
+    } else if (c != '\\r') {
       cmdLine += c;
     }
   }
@@ -204,10 +235,10 @@ export const FirmwareSketchModal: React.FC<FirmwareSketchModalProps> = ({ open, 
         <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 border-b border-slate-800">
           <div>
             <h3 className="text-sm font-semibold text-slate-100">
-              Прошивки робота: ESP32 (Wi-Fi POISK_LAN) + Mega2560 (VexV5)
+              Прошивки КПМИС (Vex V5 Shield): ESP-WROOM-32 + Mega2560
             </h3>
             <p className="text-xs text-slate-400">
-              Bluetooth удалён — ESP32 подключается к Wi-Fi POISK_LAN и общается с Mega2560 по Serial2
+              Стандартные библиотеки WiFi.h + ESPmDNS.h · Связь ESP32 Serial ↔ Mega2560 Serial2
             </p>
           </div>
           <div className="flex items-center gap-2">
@@ -229,7 +260,22 @@ export const FirmwareSketchModal: React.FC<FirmwareSketchModalProps> = ({ open, 
           </div>
         </div>
 
-        <div className="flex gap-1 px-4 pt-3 bg-slate-950 border-b border-slate-800">
+        <div className="px-4 py-2.5 bg-amber-500/10 border-b border-amber-500/30 text-[11px] text-amber-200 space-y-1">
+          <div>
+            <strong>Как прошить ESP32 на шилде КПМИС:</strong> Плата{' '}
+            <span className="font-mono">ESP32 Dev Module</span>, переключатель в{' '}
+            <span className="font-mono font-semibold">USB</span> → при{' '}
+            <span className="font-mono">Connecting...</span> зажать <strong>Boot + Reset</strong> на
+            2–3 сек → отпустить <strong>Reset</strong>, затем <strong>Boot</strong>.
+          </div>
+          <div>
+            <strong>Запуск с роботом:</strong> выключить/включить питание, посмотреть IP в Serial
+            Monitor (115200), затем перевести переключатель в{' '}
+            <span className="font-mono font-semibold">MCU</span>!
+          </div>
+        </div>
+
+        <div className="flex gap-1 px-4 pt-2.5 bg-slate-950 border-b border-slate-800">
           <button
             type="button"
             onClick={() => setTab('esp32')}
@@ -239,7 +285,7 @@ export const FirmwareSketchModal: React.FC<FirmwareSketchModalProps> = ({ open, 
                 : 'bg-transparent border-transparent text-slate-400 hover:text-slate-200'
             }`}
           >
-            1. ESP32_WiFi_POISK_LAN.ino
+            1. ESP32_POISK_LAN.ino (WiFi.h)
           </button>
           <button
             type="button"
@@ -250,11 +296,11 @@ export const FirmwareSketchModal: React.FC<FirmwareSketchModalProps> = ({ open, 
                 : 'bg-transparent border-transparent text-slate-400 hover:text-slate-200'
             }`}
           >
-            2. Mega2560_VexV5.ino
+            2. Mega2560_VexV5.ino (Serial2)
           </button>
         </div>
 
-        <pre className="p-4 max-h-[65vh] overflow-auto bg-slate-950 text-xs font-mono text-emerald-300 leading-relaxed">
+        <pre className="p-4 max-h-[58vh] overflow-auto bg-slate-950 text-xs font-mono text-emerald-300 leading-relaxed">
           {activeCode}
         </pre>
       </div>

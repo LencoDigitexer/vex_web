@@ -1,80 +1,73 @@
-# vex_web
+# vex_web / bro_bot
 
-# bro_bot
-Прототип робота с манипулятором
+Веб-консоль управления роботом **bro_bot** для работы в локальной сети Wi-Fi **`POISK_LAN`** без Bluetooth.
 
+## Архитектура системы (плата КПМИС Vex V5 Arduino Shield)
 
-# Оборудование
+1. **Ноутбук (Ubuntu)** — запускает локальный сервер (`http://0.0.0.0:3000`), открывает веб-интерфейс управления и держит TCP-соединение с ESP32.
+2. **Android-смартфон** — подключается к сети **`POISK_LAN`**, открывает веб-интерфейс в режиме **«Телефон (Камера/GPS)»** и передаёт видео с камеры, GPS и акселерометр на ноутбук.
+3. **Встроенная ESP-WROOM-32** — подключается к Wi-Fi **`POISK_LAN`** с использованием стандартного `<WiFi.h>` (`WiFiServer` на порту `8080`), пересылает данные через свой UART0 (`Serial`) на `Serial2` платы Mega2560 (переключатель на шилде в положении **`MCU`**).
+4. **Arduino Mega2560 + VexV5 Shield** — управляет заднеприводным шасси (`VEX5_PORT_1` — правое колесо, `VEX5_PORT_6` — левое), датчиками и 6-DOF манипулятором Dynamixel.
 
-- Тележка с 2-мя моторами
-    - VexV5 Arduino Shield (Mega2560 <--> Serial2 <--> ESP32)
-    - VexV5 Motor With Encoder
-    - Металлический каркас - заднеприводный (VEX5_PORT_1 - правое колесо, VEX5_PORT_6 - левое)
+---
 
-- Манипулятор уловой с 6 моторами Dynamixel.
-- android смартфон с камерой, gps, wifi, акселерометром и прочим
-- Ноутбук с Ubuntu 26.04
-- Wifi с именем POISK_LAN
+## Запуск на компьютере (Ubuntu)
 
-# Примеры кода
+### 1. Установка и запуск веб-сервера
 
-- Движение вперед мотором VexV5 https://github.com/vex-ru/VexV5
+```bash
+git clone https://github.com/LencoDigitexer/vex_web.git
+cd vex_web
 
-```cpp
-#include <Vex5.h>
+npm install
 
-#define BAUDRATE         (500000) //SPI speed
-#define SPI_NSS_PIN      (-1)     //Use jumper
-#define IS_RESET_SHIELD  (0)      //Keep servo positions during reset
+# Запуск в режиме разработки
+npm run dev
 
-Vex5_Motor motor;
-int32_t goalPosition = 0;
-int16_t maxSpeed = 200;
-int16_t maxCurrent_mA = 0; //0 - unlimited
-int16_t realSpeed = 0;
-int32_t realPosition = 0;
-int16_t realPower = 0;
-
-unsigned long time = millis();
-
-void setup() {
-  Serial.begin(115200);
-  Vex5.begin(BAUDRATE, SPI_NSS_PIN, IS_RESET_SHIELD);
-  motor.begin(VEX5_PORT_1);
-  motor.resetEncoder();
-  time = millis();
-}
-
-void loop() {
-  if(millis() - time > 1000 && realSpeed == 0) {
-    time = millis();
-    goalPosition = goalPosition + Vex5.deg_to_ticks(90);
-    motor.setMaxCurrent(maxCurrent_mA);
-    motor.setPosition(goalPosition, maxSpeed);
-  } 
-  motor.getSpeed(realSpeed);
-  motor.getPosition(realPosition);
-  delay(10);
-  motor.getPower(realPower);
-  Serial.print("Goal Position:\t" + String(goalPosition) + "\t");
-  Serial.println("Real Position Speed Power:\t" + String(realPosition) + "\t" + String(realSpeed) + "\t" + String(realPower));
-  delay(300);
-}
+# Либо сборка и запуск production-сервера
+npm run build
+npm start
 ```
 
+После запуска сервер слушает порт **3000** и выведет локальный IP ноутбука в сети `POISK_LAN`, например:
 
-
-- Общение между Mega2560 и ESP32 с прошивкой Bluetooth2Serial для ESP32
-
-```cpp
-void setup() { 
-    Serial.begin(115200); 
-    Serial2.begin(115200);
-}
-
-void loop() {
-    if (Serial2.available()) { 
-        Serial.write(Serial2.read());
-    }
-}
+```text
+[vex_web] POISK_LAN Relay & Web server listening on http://0.0.0.0:3000
+[vex_web] Local Wi-Fi URL: http://192.168.1.42:3000
 ```
+
+Если на Ubuntu включён `ufw`:
+
+```bash
+sudo ufw allow 3000/tcp
+```
+
+---
+
+## Прошивка встроенной ESP32 и Mega2560 (по инструкции КПМИС)
+
+### 1. Прошивка ESP-WROOM-32
+1. В Arduino IDE добавьте URL менеджера плат:
+   `https://dl.espressif.com/dl/package_esp32_index.json`
+2. Установите пакет **esp32** и выберите плату **`ESP32 Dev Module`**.
+3. Нажмите в веб-интерфейсе кнопку **«Прошивки ESP32 + Mega2560»** и скопируйте скетч **`1. ESP32_POISK_LAN.ino`** (использует только встроенные `WiFi.h` и `ESPmDNS.h`, сторонние библиотеки не нужны).
+4. Впишите пароль от сети `POISK_LAN` (или оставьте `""`, если сеть открытая).
+5. Переведите переключатель на контроллере КПМИС в положение **`USB`** и подключите кабель к ПК.
+6. Нажмите **Загрузка**. Когда в консоли появится `Connecting...`, зажмите на **2–3 секунды обе кнопки Boot + Reset**, затем отпустите **Reset** и потом **Boot**.
+7. После завершения загрузки **выключите и снова включите питание** контроллера.
+8. Откройте **Монитор порта (115200 бод)** при переключателе в положении **`USB`** и посмотрите выданный IP-адрес (`ESP32 IP: 192.168.x.xxx`).
+9. Переведите переключатель на плате в положение **`MCU`** — теперь `Serial` на ESP32 напрямую соединён с `Serial2` на Mega2560.
+
+### 2. Прошивка Arduino Mega2560
+1. Подключите библиотеку из папки `VexV5-main` в Arduino IDE (`Скетч -> Подключить библиотеку -> Добавить .ZIP/папку`).
+2. Скопируйте скетч **`2. Mega2560_VexV5.ino`** из кнопки **«Прошивки ESP32 + Mega2560»** и загрузите в Mega2560.
+
+---
+
+## Подключение всех устройств в сети `POISK_LAN`
+
+1. **На ноутбуке**: откройте `http://localhost:3000`, введите IP-адрес ESP32 (например `192.168.1.50`, порт `8080`) или `brobot.local` и нажмите **«Подкл. TCP»**.
+2. **На смартфоне**: отсканируйте **«QR для телефона»** или откройте `http://<IP_ноутбука>:3000/?role=phone&room=bro_bot_1` в Chrome.
+   - Для работы камеры и GPS по `http://` на телефоне откройте `chrome://flags/#unsafely-treat-insecure-origin-as-secure`, добавьте `http://<IP_ноутбука>:3000`, выберите **Enabled** и перезапустите Chrome.
+3. Нажмите **«Включить камеру → ПК»** и **«Включить GPS + IMU → ПК»**.
+4. Управляйте роботом с ноутбука кнопками или клавишами **W / A / S / D / Пробел**.

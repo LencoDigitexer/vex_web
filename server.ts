@@ -1,4 +1,5 @@
 import http from 'node:http';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -6,6 +7,7 @@ import express from 'express';
 import { WebSocket, WebSocketServer } from 'ws';
 import type {
   ClientRole,
+  Esp32Status,
   PhoneGpsData,
   PhoneImuData,
   RelayClientMessage,
@@ -30,6 +32,9 @@ interface RoomState {
   latestCameraFrame: string | null;
   gps: PhoneGpsData | null;
   imu: PhoneImuData | null;
+  esp32Socket: net.Socket | null;
+  esp32RxBuffer: string;
+  esp32Status: Esp32Status;
 }
 
 const rooms = new Map<string, RoomState>();
@@ -45,6 +50,15 @@ function getOrCreateRoom(roomId: string): RoomState {
       latestCameraFrame: null,
       gps: null,
       imu: null,
+      esp32Socket: null,
+      esp32RxBuffer: '',
+      esp32Status: {
+        connected: false,
+        host: 'brobot.local',
+        port: 8080,
+        wifiSsid: 'POISK_LAN',
+        lastError: null,
+      },
     };
     rooms.set(cleanId, room);
   }
@@ -79,6 +93,7 @@ function buildSnapshot(room: RoomState): RoomSnapshot {
     latestCameraFrame: room.latestCameraFrame,
     gps: room.gps,
     imu: room.imu,
+    esp32Status: room.esp32Status,
     serverTime: Date.now(),
   };
 }
@@ -116,14 +131,92 @@ function broadcastPresence(room: RoomState) {
   });
 }
 
+function disconnectEsp32Tcp(room: RoomState, reason: string | null = null) {
+  if (room.esp32Socket) {
+    room.esp32Socket.removeAllListeners();
+    room.esp32Socket.destroy();
+    room.esp32Socket = null;
+  }
+  room.esp32RxBuffer = '';
+  room.esp32Status = {
+    ...room.esp32Status,
+    connected: false,
+    lastError: reason,
+  };
+  broadcastRoom(room, { type: 'esp32:status', status: room.esp32Status });
+}
+
+function connectEsp32Tcp(room: RoomState, host: string, port: number) {
+  disconnectEsp32Tcp(room, null);
+
+  const cleanHost = host.trim() || 'brobot.local';
+  const cleanPort = Number.isFinite(port) && port > 0 ? Math.round(port) : 8080;
+
+  room.esp32Status = {
+    connected: false,
+    host: cleanHost,
+    port: cleanPort,
+    wifiSsid: 'POISK_LAN',
+    lastError: null,
+  };
+
+  const tcp = new net.Socket();
+  tcp.setNoDelay(true);
+  tcp.setTimeout(5000);
+  room.esp32Socket = tcp;
+
+  tcp.connect(cleanPort, cleanHost, () => {
+    tcp.setTimeout(0);
+    room.esp32Status = {
+      connected: true,
+      host: cleanHost,
+      port: cleanPort,
+      wifiSsid: 'POISK_LAN',
+      lastError: null,
+    };
+    broadcastRoom(room, { type: 'esp32:status', status: room.esp32Status });
+    broadcastRoom(room, {
+      type: 'esp32:rx',
+      lines: [`[ESP32 TCP ✓] Подключено к ${cleanHost}:${cleanPort} (POISK_LAN)`],
+    });
+  });
+
+  tcp.on('data', (chunk) => {
+    room.esp32RxBuffer += chunk.toString('utf8');
+    const parts = room.esp32RxBuffer.split(/\r?\n/);
+    room.esp32RxBuffer = parts.pop() ?? '';
+    const lines = parts.map((l) => l.trim()).filter((l) => l.length > 0);
+    if (lines.length > 0) {
+      broadcastRoom(room, { type: 'esp32:rx', lines }, 'pc');
+    }
+  });
+
+  tcp.on('timeout', () => {
+    disconnectEsp32Tcp(
+      room,
+      `Таймаут подключения к ${cleanHost}:${cleanPort}. Проверьте IP ESP32 и Wi-Fi POISK_LAN.`
+    );
+  });
+
+  tcp.on('error', (err) => {
+    disconnectEsp32Tcp(room, `Ошибка TCP (${cleanHost}:${cleanPort}): ${err.message}`);
+  });
+
+  tcp.on('close', () => {
+    if (room.esp32Socket === tcp) {
+      disconnectEsp32Tcp(room, null);
+    }
+  });
+}
+
 function getLanAddresses(port: number): string[] {
   const nets = os.networkInterfaces();
   const urls: string[] = [];
   for (const entries of Object.values(nets)) {
     if (!entries) continue;
-    for (const net of entries) {
-      if (net.family === 'IPv4' && !net.internal) {
-        urls.push(`http://${net.address}:${port}`);
+    for (const netIf of entries) {
+      if (netIf.family === 'IPv4' && !netIf.internal) {
+        urls.push(`http://${netIf.address}:${port}`);
       }
     }
   }
@@ -142,6 +235,7 @@ async function startServer() {
         phoneOnline: presence.phoneOnline,
         pcCount: presence.pcCount,
         cameraActive: r.cameraActive,
+        esp32Connected: r.esp32Status.connected,
       };
     });
     res.json({ ok: true, activeRooms, serverTime: Date.now() });
@@ -195,6 +289,24 @@ async function startServer() {
       const roomId = msg.roomId || meta.roomId;
       if (!roomId) return;
       const room = getOrCreateRoom(roomId);
+
+      if (msg.type === 'esp32:connect') {
+        connectEsp32Tcp(room, msg.host, msg.port);
+        return;
+      }
+
+      if (msg.type === 'esp32:disconnect') {
+        disconnectEsp32Tcp(room, null);
+        return;
+      }
+
+      if (msg.type === 'esp32:send') {
+        if (room.esp32Socket && !room.esp32Socket.destroyed) {
+          const payload = msg.line.endsWith('\n') ? msg.line : `${msg.line}\n`;
+          room.esp32Socket.write(payload);
+        }
+        return;
+      }
 
       if (msg.type === 'phone:camera_frame') {
         room.cameraActive = msg.cameraActive;
